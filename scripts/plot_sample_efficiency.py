@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Plot paired sample-efficiency variants from ssilite JSON output.
+"""Plot paired formal-MoE sample-efficiency variants from ssilite JSON output.
 
 Example:
 
@@ -37,7 +37,7 @@ class ArmStyle:
 ARMS = (
     ArmStyle(
         "ordinary_mean",
-        "Ordinary — mean (baseline)",
+        "Ordinary experts — dense mean (baseline)",
         "#202020",
         "-",
         "o",
@@ -45,7 +45,7 @@ ARMS = (
     ),
     ArmStyle(
         "ordinary_routed",
-        "Ordinary — routed (gate only)",
+        "Ordinary MoE — top-1 router (gate only)",
         "#777777",
         ":",
         "o",
@@ -54,7 +54,7 @@ ARMS = (
     ),
     ArmStyle(
         "specialist_mean",
-        "Specialists — mean (no routing)",
+        "Specialized experts — dense mean (no routing)",
         "#0072B2",
         "--",
         "^",
@@ -62,7 +62,7 @@ ARMS = (
     ),
     ArmStyle(
         "permuted_routed_specialist",
-        "Specialists — routed (permuted)",
+        "Specialized MoE — permuted environments",
         "#E69F00",
         "-.",
         "D",
@@ -70,7 +70,7 @@ ARMS = (
     ),
     ArmStyle(
         "routed_specialist",
-        "Specialists — routed (feature environments)",
+        "Environment MoE — matching top-1 router",
         "#009E73",
         "-",
         "s",
@@ -143,7 +143,7 @@ def _load_results(input_path: str) -> list[dict[str, Any]]:
 
 def _validated_axes(
     results: list[dict[str, Any]],
-) -> tuple[list[int], list[int], int, int]:
+) -> tuple[list[int], list[int], int, int, int]:
     seeds = [int(result["seed"]) for result in results]
     if len(set(seeds)) != len(seeds):
         raise ValueError("seed identifiers must be unique")
@@ -157,6 +157,7 @@ def _validated_axes(
     target = float(results[0]["config"]["minority_target"])
     majority_floor = float(results[0]["config"]["majority_floor"])
     backward_examples: int | None = None
+    router_training_examples: int | None = None
     for result in results:
         if [int(point["new_labels"]) for point in result["points"]] != budgets:
             raise ValueError("all seeds must contain identical ordered budgets")
@@ -175,10 +176,23 @@ def _validated_axes(
                 if backward_examples is None:
                     backward_examples = arm_backward
                 elif arm_backward != backward_examples:
-                    raise ValueError("population arms used unequal backward examples")
+                    raise ValueError("MoE arms used unequal backward examples")
+                arm_router = int(payload["compute"]["router_training_examples"])
+                if router_training_examples is None:
+                    router_training_examples = arm_router
+                elif arm_router != router_training_examples:
+                    raise ValueError("MoE arms used unequal router-training examples")
     if backward_examples is None:
         raise ValueError("no arm compute was found")
-    return seeds, budgets, backward_examples, int(results[0]["initial_labels"])
+    if router_training_examples is None:
+        raise ValueError("no router compute was found")
+    return (
+        seeds,
+        budgets,
+        backward_examples,
+        router_training_examples,
+        int(results[0]["initial_labels"]),
+    )
 
 
 def _values(
@@ -292,6 +306,7 @@ def _plot(
     results: list[dict[str, Any]],
     budgets: list[int],
     backward_examples: int,
+    router_training_examples: int,
     output_prefix: Path,
 ) -> None:
     import matplotlib.pyplot as plt
@@ -465,7 +480,7 @@ def _plot(
     ).mean
     if full_at_64 is not None and full_at_64 >= 0.85 and baseline_at_max < 0.85:
         minority_axis.annotate(
-            "Observed 0.85 mean crossing:\nrouted ≤64 labels\n"
+            "Observed 0.85 mean crossing:\ntop-1 MoE ≤64 labels\n"
             f"ordinary >{budgets[-1]}  ⇒  >4x (right-censored)",
             xy=(64, full_at_64),
             xytext=(104, 0.725),
@@ -496,7 +511,7 @@ def _plot(
         handlelength=3,
     )
     figure.suptitle(
-        "Structured specialist populations use labeled support more efficiently",
+        "Environment-routed MoE uses labeled support more efficiently",
         fontsize=16,
         fontweight="bold",
         y=1.025,
@@ -507,7 +522,8 @@ def _plot(
         (
             f"{len(results)} paired synthetic data seeds • shading: pointwise 95% "
             f"Student-t intervals • {backward_examples:,} backward examples per "
-            "population arm\n"
+            f"MoE arm + {router_training_examples:,} router examples • one "
+            "selected expert at inference\n"
             "All 4,096 unlabeled candidates are inspected at every budget; "
             "connecting lines join tested budgets only. Group identity is "
             "evaluation-only."
@@ -582,11 +598,19 @@ def main(argv: list[str] | None = None) -> None:
     arguments = parser.parse_args(argv)
 
     results = _load_results(arguments.input)
-    _, budgets, backward_examples, _ = _validated_axes(results)
+    _, budgets, backward_examples, router_training_examples, _ = _validated_axes(
+        results
+    )
     output_prefix = Path(arguments.output_prefix).resolve()
     summary_rows = _summary_rows(results, budgets)
     _write_artifacts(results, summary_rows, output_prefix)
-    _plot(results, budgets, backward_examples, output_prefix)
+    _plot(
+        results,
+        budgets,
+        backward_examples,
+        router_training_examples,
+        output_prefix,
+    )
     print(output_prefix.with_suffix(".svg"))
     print(output_prefix.with_suffix(".png"))
     print(output_prefix.with_suffix(".csv"))

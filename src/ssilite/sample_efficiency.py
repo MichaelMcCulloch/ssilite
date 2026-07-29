@@ -1,14 +1,14 @@
-"""Lean matched sample-efficiency benchmark for final student populations.
+"""Lean matched sample-efficiency benchmark for formal environment MoEs.
 
 Each data seed creates one synthetic problem and one label-free acquisition
 ordering.  Nested prefixes of that ordering define the support curve.  At each
-budget, environments are discovered from raw train features alone and passed
-directly to the equal-compute final mixture.  There is no out-of-fold grader,
-trust filter, or unrelated learner in this benchmark.
+budget, environments are discovered from raw train features alone and used to
+supervise a learned top-1 router plus coherent expert curricula.  There is no
+out-of-fold grader, trust filter, or unrelated learner in this benchmark.
 
 Rare-group and clean-label metadata are used only after training to report
 support denominators and clean-test accuracy.  Neither environment discovery nor
-the final student populations can receive them.
+the final MoEs can receive them.
 """
 
 from __future__ import annotations
@@ -25,10 +25,10 @@ from torch import Tensor
 from .acquisition import acquire_for_cluster_coverage
 from .data import DatasetSplit, make_support_problem
 from .environment_ensemble import discover_feature_environments
-from .environment_mixture import (
-    EnvironmentMixtureCompute,
-    EnvironmentMixtureConfig,
-    train_environment_mixture,
+from .environment_moe import (
+    EnvironmentMoECompute,
+    EnvironmentMoEConfig,
+    train_environment_moe,
 )
 from .model import Accuracy
 
@@ -59,7 +59,7 @@ class SampleEfficiencyConfig:
     kmeans_iterations: int = 20
     acquisition_seed_offset: int = 1
     discovery_seed_offset: int = 20_000
-    mixture_seed_offset: int = 40_000
+    moe_seed_offset: int = 40_000
     permutation_seed_offset: int = 90_000
     device: str = "auto"
 
@@ -70,7 +70,7 @@ class SampleEfficiencyArm:
 
     accuracy: Accuracy
     target_attained: bool
-    compute: EnvironmentMixtureCompute
+    compute: EnvironmentMoECompute
 
 
 @dataclass(frozen=True)
@@ -83,8 +83,13 @@ class SampleEfficiencyPoint:
     total_rare_examples: int
     environment_cluster_sizes: tuple[int, ...]
     permuted_environment_cluster_sizes: tuple[int, ...]
-    model_seeds: tuple[int, ...]
-    permuted_model_seeds: tuple[int, ...]
+    model_seed: int
+    permuted_model_seed: int
+    router_train_accuracy: float
+    route_counts: tuple[int, ...]
+    minority_route_counts: tuple[int, ...]
+    majority_route_counts: tuple[int, ...]
+    specialist_expert_accuracies: tuple[Accuracy, ...]
     ordinary_mean: SampleEfficiencyArm
     ordinary_routed: SampleEfficiencyArm
     specialist_mean: SampleEfficiencyArm
@@ -117,7 +122,7 @@ class SampleEfficiencyResult:
     seed: int
     device: str
     config: SampleEfficiencyConfig
-    mixture_config: EnvironmentMixtureConfig
+    moe_config: EnvironmentMoEConfig
     initial_labels: int
     initial_rare_examples: int
     acquisition_seed: int
@@ -193,7 +198,7 @@ def _arm(
     logits: Tensor,
     test: DatasetSplit,
     *,
-    compute: EnvironmentMixtureCompute,
+    compute: EnvironmentMoECompute,
     minority_target: float,
     majority_floor: float,
 ) -> SampleEfficiencyArm:
@@ -272,7 +277,7 @@ def run_sample_efficiency(
     *,
     seed: int = 0,
     config: SampleEfficiencyConfig | None = None,
-    mixture_config: EnvironmentMixtureConfig | None = None,
+    moe_config: EnvironmentMoEConfig | None = None,
 ) -> SampleEfficiencyResult:
     """Run one paired seed over nested label-acquisition prefixes."""
 
@@ -301,9 +306,8 @@ def run_sample_efficiency(
     )
     discovery_seed = config.discovery_seed_offset + seed
     permutation_seed = config.permutation_seed_offset + seed
-    resolved_mixture_config = replace(
-        mixture_config
-        or EnvironmentMixtureConfig(seed=config.mixture_seed_offset + seed),
+    resolved_moe_config = replace(
+        moe_config or EnvironmentMoEConfig(seed=config.moe_seed_offset + seed),
         device=str(execution_device),
     )
     test = problem.test.to(execution_device)
@@ -321,75 +325,67 @@ def run_sample_efficiency(
             seed=discovery_seed,
             device=execution_device,
         )
-        mixture = train_environment_mixture(
+        moe = train_environment_moe(
             support.features,
             support.labels,
             test.features,
             environment_ids,
-            config=resolved_mixture_config,
+            config=resolved_moe_config,
         )
         permuted_environment_ids = _permuted_environments(
             environment_ids,
             seed=permutation_seed,
         )
-        permuted_mixture = train_environment_mixture(
+        permuted_moe = train_environment_moe(
             support.features,
             support.labels,
             test.features,
             permuted_environment_ids,
-            config=resolved_mixture_config,
+            config=resolved_moe_config,
         )
-        if mixture.ordinary.compute != mixture.specialist.compute:
-            raise RuntimeError("paired final arms used unequal compute")
-        if mixture.ordinary.compute != permuted_mixture.specialist.compute:
-            raise RuntimeError("permuted final population used unequal compute")
+        if moe.ordinary.compute != moe.specialist.compute:
+            raise RuntimeError("paired final MoE arms used unequal compute")
+        if moe.ordinary.compute != permuted_moe.specialist.compute:
+            raise RuntimeError("permuted final MoE used unequal compute")
+        if not torch.equal(moe.ordinary.model_seed, moe.specialist.model_seed):
+            raise RuntimeError("paired final MoE arms used unequal model seeds")
         if not torch.equal(
-            mixture.ordinary.model_seeds,
-            mixture.specialist.model_seeds,
+            moe.ordinary.model_seed,
+            permuted_moe.specialist.model_seed,
         ):
-            raise RuntimeError("paired final arms used unequal model seeds")
-        if not torch.equal(
-            mixture.ordinary.model_seeds,
-            permuted_mixture.specialist.model_seeds,
-        ):
-            raise RuntimeError("permuted final population used unequal model seeds")
-        test_indices = torch.arange(test.labels.numel(), device=execution_device)
-        ordinary_routed_logits = mixture.ordinary.logits[
-            mixture.specialist.routed_student_indices,
-            test_indices,
-        ]
+            raise RuntimeError("permuted final MoE used an unequal model seed")
         ordinary_mean = _arm(
-            mixture.ordinary.mean_logits,
+            moe.ordinary.mean_logits,
             test,
-            compute=mixture.ordinary.compute,
+            compute=moe.ordinary.compute,
             minority_target=config.minority_target,
             majority_floor=config.majority_floor,
         )
         ordinary_routed = _arm(
-            ordinary_routed_logits,
+            moe.ordinary.routed_logits,
             test,
-            compute=mixture.ordinary.compute,
+            compute=moe.ordinary.compute,
             minority_target=config.minority_target,
             majority_floor=config.majority_floor,
         )
         specialist_mean = _arm(
-            mixture.specialist.mean_logits,
+            moe.specialist.mean_logits,
             test,
-            compute=mixture.specialist.compute,
+            compute=moe.specialist.compute,
             minority_target=config.minority_target,
             majority_floor=config.majority_floor,
         )
         routed_specialist = _arm(
-            mixture.specialist.routed_logits,
+            moe.specialist.routed_logits,
             test,
-            compute=mixture.specialist.compute,
+            compute=moe.specialist.compute,
             minority_target=config.minority_target,
             majority_floor=config.majority_floor,
         )
         permuted_routed_specialist = _arm(
-            permuted_mixture.specialist.routed_logits,
+            permuted_moe.specialist.routed_logits,
             test,
-            compute=permuted_mixture.specialist.compute,
+            compute=permuted_moe.specialist.compute,
             minority_target=config.minority_target,
             majority_floor=config.majority_floor,
         )
@@ -413,13 +409,31 @@ def run_sample_efficiency(
                         minlength=config.num_environments,
                     ).tolist()
                 ),
-                model_seeds=tuple(
-                    int(model_seed)
-                    for model_seed in mixture.ordinary.model_seeds.tolist()
+                model_seed=int(moe.ordinary.model_seed.item()),
+                permuted_model_seed=int(permuted_moe.specialist.model_seed.item()),
+                router_train_accuracy=float(
+                    moe.specialist.router_train_accuracy.item()
                 ),
-                permuted_model_seeds=tuple(
-                    int(model_seed)
-                    for model_seed in permuted_mixture.specialist.model_seeds.tolist()
+                route_counts=tuple(
+                    int(count) for count in moe.specialist.route_counts.tolist()
+                ),
+                minority_route_counts=tuple(
+                    int(count)
+                    for count in torch.bincount(
+                        moe.specialist.routed_expert_indices[test.minority],
+                        minlength=config.num_environments,
+                    ).tolist()
+                ),
+                majority_route_counts=tuple(
+                    int(count)
+                    for count in torch.bincount(
+                        moe.specialist.routed_expert_indices[~test.minority],
+                        minlength=config.num_environments,
+                    ).tolist()
+                ),
+                specialist_expert_accuracies=tuple(
+                    _accuracy(expert_logits, test)
+                    for expert_logits in moe.specialist.logits
                 ),
                 ordinary_mean=ordinary_mean,
                 ordinary_routed=ordinary_routed,
@@ -434,7 +448,7 @@ def run_sample_efficiency(
         seed=seed,
         device=str(execution_device),
         config=replace(config, device=str(execution_device)),
-        mixture_config=resolved_mixture_config,
+        moe_config=resolved_moe_config,
         initial_labels=initial_labels,
         initial_rare_examples=initial_rare_examples,
         acquisition_seed=acquisition_seed,
@@ -465,8 +479,9 @@ def run_sample_efficiency(
             "Acquisition and environment discovery use raw pool/train features "
             "without labels, but the fixed unlabeled reservoir is observation "
             "access. Rare-group and clean-label fields are post-hoc diagnostics. "
-            "Permuted environments preserve cluster sizes and use paired final "
-            "seeds and batch-stream seeds. "
+            "Discovered environments pseudo-supervise the learned router and "
+            "teacher-force task dispatch during training. Permuted environments "
+            "preserve cluster sizes and use paired model and batch-stream seeds. "
             "Target crossings are grid-censored first observed attainments; "
             "stochastic accuracy need not be monotone."
         ),
@@ -477,7 +492,7 @@ def main(argv: list[str] | None = None) -> None:
     """Run one or more paired seeds and print strict JSON."""
 
     parser = argparse.ArgumentParser(
-        description="Benchmark ordinary means against routed environment specialists."
+        description="Benchmark dense means against a formal environment-routed MoE."
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument(

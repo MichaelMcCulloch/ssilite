@@ -7,10 +7,10 @@ A PyTorch reconstruction of one narrow question:
 > precision is worth its cost?
 
 The first prototype separated acquisition, robust weighting, sampling, and
-precision. Fable's follow-up then exposed the missing variable: a scalar loss
-ranking cannot recover a coherent partition. This repository now tests whether
-out-of-fold students trained under deliberately different, label-free
-environments can supply that structure.
+precision. The follow-up exposed the missing variable: a scalar loss ranking
+cannot recover a coherent partition. The final experiment now asks whether a
+formal sparse mixture of experts, trained under deliberately different
+label-free environments, can supply that structure.
 
 This is a mechanism experiment, not evidence about SSI's private research.
 
@@ -76,6 +76,18 @@ L_k(\theta)=
 \sum_k r_k L_k(\theta).
 ```
 
+The final experiment compiles that population into a formal hard-routed MoE:
+
+```math
+\widehat e(x)=\arg\max_e r_\phi(e\mid x),
+\qquad
+f_{\mathrm{MoE}}(x)=f_{\theta_{\widehat e(x)}}(x).
+```
+
+Cluster assignments train `r_phi` as pseudo-labels. Task batches use those
+assignments for teacher-forced sparse dispatch, while the test-time route is
+the router's learned top-1 choice.
+
 ## Run it
 
 The command-line entry points default to CUDA when it is available:
@@ -93,11 +105,11 @@ uv run ssilite-sample-efficiency \
 
 `ssilite` runs the original acquisition plus `q/p/b` prototype.
 `ssilite-followup` runs the corrected version of Fable's trust bootstrap.
-`ssilite-reconstruction` runs ordinary students, environment specialists,
-permuted-environment controls, a partition-level adversary, and final routed
-student populations.
-`ssilite-sample-efficiency` runs the lean nested-support curve without the
-out-of-fold trust filter.
+`ssilite-reconstruction` retains the earlier independent-population
+reconstruction and its identifiability controls. `ssilite-sample-efficiency`
+runs the final formal-MoE experiment: one tensorized expert bank, one learned
+top-1 router, and the lean nested-support curve without the out-of-fold trust
+filter.
 
 The reported experiments below used:
 
@@ -120,7 +132,7 @@ uv run --with mypy mypy src/ssilite
 uv build
 ```
 
-Current local verification: 62 tests, Ruff lint and format, Mypy, and source
+Current local verification: 69 tests, Ruff lint and format, Mypy, and source
 plus wheel builds.
 
 ## Layout
@@ -136,11 +148,13 @@ plus wheel builds.
   students, iterative trust, and permanence control.
 - `adversarial.py`: bounded dual optimization over discovered environments.
 - `environment_mixture.py`: equal-compute final ordinary and routed specialist
-  populations.
-- `sample_efficiency.py`: nested-support, matched-backward-compute population
-  benchmark with grid-censored target crossings.
+  populations retained as the pre-MoE control.
+- `environment_moe.py`: one learned router, a contiguous expert bank,
+  teacher-forced specialist training, and genuine sparse top-1 dispatch.
+- `sample_efficiency.py`: nested-support, matched-compute formal-MoE benchmark
+  with grid-censored target crossings and per-expert routing diagnostics.
 - `scripts/plot_sample_efficiency.py`: paired uncertainty plots and compact
-  CSV/JSON artifact generation for every final-population control.
+  CSV/JSON artifact generation for every formal-MoE control.
 - `experiment.py`: original support-acquisition experiment.
 - `followup.py`: corrected Fable controls.
 - `reconstruction.py`: paired SSI-hypothesis experiment and counterexample.
@@ -239,10 +253,10 @@ environment adversary were not significantly better than ordinary trust.
 The signal was real, but collapsing the population back into one set of
 weights discarded most of it.
 
-## Keep the population alive
+## Pre-MoE intermediate: keep the population alive
 
-The final test trains equal-compute populations and evaluates four causal
-controls:
+Before compiling the mechanism into one model, an intermediate test trained
+equal-compute independent populations and evaluated five causal arms:
 
 - ordinary students, probability averaged;
 - ordinary students, routed through the same gate;
@@ -280,42 +294,76 @@ larger two-hidden-layer model in `experiment.py`.
 
 ## Quantifying label efficiency
 
-The clean curve removes the expensive out-of-fold trust filter. For each of 16
-paired CUDA data seeds, it creates one 256-point acquisition ordering and
-reuses nested prefixes. At every prefix the ordinary population and routed
-specialists see identical labeled support, model seeds, batch streams, four
-model fits, and 20,480 backward examples. Environment discovery sees raw
-features but no labels.
+The clean curve now uses a formal MoE rather than an ensemble. Each arm is one
+`nn.Module` with three experts stored in contiguous parameter tensors, one
+learned linear router, one optimizer, and hard top-1 sparse inference. Feature
+clustering supplies pseudo-labels to the router. During task training those
+same IDs teacher-force dispatch, so a randomly initialized router cannot starve
+an expert before specialization begins.
 
-Rare-group counts below are post-hoc diagnostics; group membership is never
-given to acquisition or training.
+At every step each expert receives 64 examples. The task loss is
 
-![All population variants against the ordinary baseline](artifacts/sample_efficiency_variants.png)
+```math
+\mathcal L_{\mathrm{task}}=
+\sum_{e=1}^{3}
+\frac{1}{64}\sum_{j=1}^{64}
+\ell(f_{\theta_e}(x_{e,j}),y_{e,j}),
+```
+
+and a separate environment-balanced batch trains the router. Every arm uses 80
+physical optimizer steps, 240 logical expert updates, 15,360 task examples,
+and 5,120 router examples. Counting both objectives gives the same 20,480
+gradient-bearing examples as the earlier four-fit population, but the deployed
+path evaluates only one selected expert.
+
+For each of 16 paired CUDA data seeds, the benchmark creates one 256-point
+acquisition ordering and reuses nested prefixes. Ordinary and specialized MoEs
+see identical labeled support, initialization, router batches, and random
+streams. Environment discovery sees raw features but no labels. Rare-group and
+clean-label fields are used only after training for evaluation.
+
+![All formal MoE variants against the ordinary baseline](artifacts/sample_efficiency_variants.png)
 
 [Vector figure](artifacts/sample_efficiency_variants.svg),
 [summary data](artifacts/sample_efficiency_variants.csv), and
 [paired seed-level results](artifacts/sample_efficiency_variants.json) are
-included. The bottom panels subtract the ordinary mean within the same seed and
-budget before computing uncertainty.
+included. The bottom panels subtract the ordinary dense mean within the same
+seed and budget before computing uncertainty.
 
-The controls identify the active conjunction. At 64 new labels, minority
-accuracy was `0.566` for ordinary averaging, `0.569` for routing ordinary
-students, `0.608` for averaging specialists, `0.575` for specialists routed
-through permuted environments, and `0.867` for specialists routed through the
-real feature environments. Routing, specialization, and decorrelation each
-fail alone; coherent specialization plus the matching gate survives.
+The five controls identify a conjunction, not a bagging effect:
 
-| New label queries | Total labels | Rare among queries | Total rare support | Ordinary minority | Routed minority | Routed 95% CI |
+| Arm at 64 new labels | Minority | Majority |
+| --- | ---: | ---: |
+| Ordinary experts, dense mean | 0.568 | 0.940 |
+| Ordinary MoE, learned router only | 0.562 | 0.927 |
+| Specialized experts, dense mean only | 0.575 | 0.920 |
+| Specialized MoE, permuted environments | 0.576 | 0.892 |
+| **Specialized MoE, matching environments** | **0.856** | **0.939** |
+
+The matching MoE improves minority accuracy over the ordinary baseline by
+`+0.288`, with paired 95% interval `[+0.265, +0.312]`; every one of the 16
+paired differences is positive. Gate-only, specialization-only, and a
+size-preserving arbitrary partition all remain near zero.
+
+| New label queries | Total labels | Rare among queries | Total rare support | Ordinary minority | MoE minority | MoE 95% CI |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 512 | 0.0 | 24.88 | 0.513 +/- 0.016 | 0.696 +/- 0.062 | [0.663, 0.729] |
-| 32 | 544 | 32.0 | 56.88 | 0.531 +/- 0.019 | 0.821 +/- 0.038 | [0.801, 0.841] |
-| 64 | 576 | 64.0 | 88.88 | 0.566 +/- 0.025 | 0.867 +/- 0.020 | [0.857, 0.878] |
-| 128 | 640 | 125.88 | 150.75 | 0.632 +/- 0.029 | 0.900 +/- 0.027 | [0.886, 0.915] |
-| 256 | 768 | 167.12 | 192.00 | 0.652 +/- 0.040 | 0.907 +/- 0.019 | [0.897, 0.916] |
+| 0 | 512 | 0.0 | 24.88 | 0.513 +/- 0.017 | 0.695 +/- 0.060 | [0.663, 0.727] |
+| 32 | 544 | 32.0 | 56.88 | 0.535 +/- 0.023 | 0.810 +/- 0.037 | [0.790, 0.830] |
+| 64 | 576 | 64.0 | 88.88 | 0.568 +/- 0.030 | 0.856 +/- 0.022 | [0.844, 0.868] |
+| 128 | 640 | 125.88 | 150.75 | 0.633 +/- 0.030 | 0.890 +/- 0.031 | [0.873, 0.907] |
+| 256 | 768 | 167.13 | 192.00 | 0.648 +/- 0.036 | 0.896 +/- 0.018 | [0.887, 0.906] |
 
 The `+/-` values are sample standard deviations across data seeds. The final
 column is a two-sided Student `t(15)` interval for mean minority accuracy.
-Mean majority accuracy stayed between `0.928` and `0.954`.
+The routed MoE's mean majority accuracy stayed between `0.928` and `0.939`.
+
+The individual expert result is the sharper proof that this is an MoE. At 64
+queries, the expert receiving the most rare routes independently reached
+`0.865 +/- 0.021` minority accuracy, with interval `[0.854, 0.876]`, but only
+`0.572` majority accuracy. The router sent `97.72%` of rare examples to that
+expert and only `0.25%` of majority examples there. It did not average weak
+generalists into a strong classifier; it learned a local rule and routed the
+right inputs to it.
 
 For a minority target `tau` and a `0.90` majority floor, define the
 mean-over-generator grid complexity
@@ -327,49 +375,58 @@ B_m(\tau)=
 \mathbb E[A_{\mathrm{majority},m}(B)]\ge0.90\}.
 ```
 
-The ordinary curve never reaches even `0.80`, so the result is right-censored:
-there is no honest finite point estimate. The observed grid gives lower bounds.
+The ordinary curve never reaches even `0.80`, so its result is right-censored:
+there is no honest finite point estimate. The observed mean grid gives lower
+bounds.
 
-| Target minority mean | Routed grid crossing | Ordinary grid censoring | New-label efficiency | Total-label efficiency | Rare-support efficiency |
+| Target minority mean | MoE grid crossing | Ordinary grid censoring | New-label efficiency | Total-label efficiency | Rare-support efficiency |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0.80 | <=32 | >256 | **>8x** | **>1.41x** | **>3.38x** |
 | 0.85 | <=64 | >256 | **>4x** | **>1.33x** | **>2.16x** |
 
-At the `0.85` target, the routed mean was `0.867` with interval
-`[0.857, 0.878]`; the ordinary mean was only `0.652` at four times the new-label
-budget. Fourteen of sixteen routed seeds met the joint `0.85/0.90` target at
-64 queries, versus zero ordinary seeds at every evaluated budget. This is
-sample efficiency conditional on the generator and target, not a
-distribution-free sample-complexity theorem.
+At the `0.85` target, the MoE mean is `0.856` at 64 queries while the ordinary
+mean is only `0.648` at four times the new-label budget. Ten of sixteen MoE
+seeds meet the joint `0.85/0.90` target at 64 queries, 15 of 16 at 128, and all
+16 at 256; no ordinary seed meets it anywhere on the grid.
 
-The plotted intervals are pointwise and should not by themselves be used to
-select a crossing after inspecting the curve. A conservative two-sided
-Bonferroni correction across all five budgets still puts the routed
-64-query minority lower bound at `0.853` and its majority lower bound at
-`0.933`; the ordinary 256-query minority upper bound is `0.681`. Thus the
-`>4x` right-censored result survives that simple simultaneous correction. The
-`>8x` row remains descriptive.
+The table is a mean-curve point estimate. The plotted intervals are pointwise
+and cannot justify selecting a crossing after looking. With a conservative
+two-sided Bonferroni correction across all five budgets, the routed 64-query
+minority lower bound is `0.840`, below the `0.85` target. At 128 queries its
+minority and majority lower bounds are `0.867` and `0.917`, while the ordinary
+256-query minority upper bound is `0.675`. Thus the inference-conservative
+statement is **greater than 2x** new-label efficiency at the `0.85` target; the
+greater-than-4x row is the right-censored mean-curve estimate.
 
 There are two different gains:
 
 - **Acquisition:** the first 64 queried points were all rare, a `19.78x` mean
   enrichment over their prevalence in the realized reservoir.
-- **Use of support:** even after counting the initial support, routed
-  specialists needed at most 88.88 mean rare examples for the `0.85` target;
-  the ordinary population failed with 192.
+- **Use of support:** the mean MoE curve reaches `0.85` with 88.88 mean rare
+  examples; under the simultaneous bound it needs 150.75. The ordinary arm
+  fails with 192.
 
 And there are two costs the label ratio omits:
 
 - every run inspects all 4,096 candidate feature vectors, or 64 observations
   per acquired label at the 64-query point;
-- equal backward examples are not equal total FLOPs: clustering, routing, and
-  diagnostic forwards remain additional work.
+- equal gradient-bearing example counts are not equal total FLOPs: clustering,
+  routing, and dense diagnostic forwards remain additional work.
 
-Thus `>4x` is the defensible population-learning number for the `0.85` target,
-while `19.78x` is a separate pool-based acquisition number. If observing a
-candidate costs an environment interaction, the latter is not an RL
-sample-efficiency gain. The population uses support efficiently; it does not
-create support.
+Thus `>2x` is the conservative MoE learning number for the `0.85` target,
+`>4x` is its observed mean-curve estimate, and `19.78x` is a separate
+pool-based acquisition number. If observing a candidate costs an environment
+interaction, the latter is not an RL sample-efficiency gain. The MoE uses
+support efficiently; it does not create support.
+
+Kimi's recent systems result changes the engineering plausibility, not this
+experiment's evidence. The [Kimi K3 report](https://arxiv.org/abs/2607.24653)
+uses far more elaborate Stable LatentMoE machinery, while
+[MoonEP](https://github.com/MoonshotAI/MoonEP) balances expert-parallel work
+across multiple accelerator ranks. This prototype implements neither. On one
+RTX 4090 there is no cross-rank expert-parallel bottleneck to solve. What does
+transfer is the systems contract: contiguous expert weights, explicit route
+plans, selected-expert execution, load telemetry, and no dropped examples.
 
 Reproduce the figure and its raw data with:
 
@@ -384,10 +441,11 @@ uv run --with 'matplotlib>=3.10' python scripts/plot_sample_efficiency.py \
 
 ## The identifiability wall
 
-The positive result assumes independent label flips. In a deliberately
-unidentifiable control, every label in the rare environment is flipped
-coherently. The observed distribution is then equally consistent with a real
-alternative mechanism.
+The positive result assumes independent label flips. This wall is
+architecture-independent: if every label in the rare environment is flipped
+coherently, the observed distribution is equally consistent with a genuine
+alternative mechanism. The earlier independent-population control measured the
+failure directly.
 
 Across eight CUDA seeds:
 
@@ -405,7 +463,9 @@ corruption. No algorithm using only the same observed distribution can.
 - Raw-feature environments are transductively discoverable and almost pure in
   this synthetic problem. Language-scale environment discovery is the hard
   unsolved object.
-- Internal students are not statistical replicates; the data seed is the unit
+- Cluster IDs pseudo-supervise the router and teacher-force expert dispatch.
+  This is a strong structural prior, not autonomous environment invention.
+- Internal experts are not statistical replicates; the data seed is the unit
   of inference.
 - Mixed precision is statistically emulated. There is no custom low-precision
   kernel or wall-clock speedup claim.
@@ -455,25 +515,39 @@ The code rules out my original strong version:
 
 The surviving hypothesis is more specific:
 
-> SSI has learned how to manufacture coherent, automatically discovered
-> training environments and force a population of students into genuinely
-> different mechanisms. Students cross-grade out of distribution; a learned
-> gate keeps the relevant specialist matched to the relevant experience and
-> possibly to inference. Robust optimization, sampling, and precision are the
-> machinery that make this population affordable, not the source of the
-> learning signal.
+> SSI has learned how to manufacture coherent training environments and turn
+> them into pseudo-supervision for sparse conditional learning. Different
+> experts are forced into different mechanisms; a learned router keeps each
+> mechanism matched to the experience and inference cases where it applies.
+> Robust optimization, sampling, and precision make that loop stable and
+> affordable, but the environment-generating rule is the learning signal.
 
-That mechanism explains the otherwise odd conjunction:
+The formal-MoE conversion makes this hypothesis less exotic and more precise.
+At 64 labels, routing alone changes minority accuracy by `-0.006`,
+specialization without routing by `+0.007`, and permuting the environments by
+`+0.008`. Matching environment specialization to the learned top-1 router
+changes it by `+0.288`. The rare expert itself reaches `0.865` accuracy on its
+local rule and fails as a generalist; the router is what turns that local
+competence into `0.939` majority accuracy. All of this lives inside one module
+and one optimizer.
+
+That mechanism explains the otherwise odd conjunction in the public clues:
 
 - the optimization hires know how to solve and stabilize the resulting
-  minimax/allocation problem;
-- a population needs much more scoring and training compute than one model,
-  making a tenfold scale-up immediately useful;
-- its workload creates a real systems co-design question—many cheap,
-  decorrelated student passes plus selective high-precision updates;
+  assignment, routing, and allocation problem;
+- more compute can buy more environments and more expert capacity without
+  activating the whole model for every token, making a tenfold scale-up useful;
+- its workload creates a real systems co-design question—cheap routing and
+  scoring, sparse expert execution, and selective high-precision updates;
 - capability and safety can share an object: explicit environments, gates,
-  and cross-student failure evidence are more inspectable than an opaque
-  corpus mixture.
+  route loads, and expert-local failure evidence are more inspectable than an
+  opaque corpus mixture.
+
+Kimi K3 is relevant here only as an existence proof for the infrastructure
+shape. Sparse expert models, contiguous expert weights, and explicit route
+plans already have highly optimized training systems. MoonEP itself is
+multi-rank execution infrastructure, not a routing or learning algorithm, and
+there is no reason to infer that SSI uses Kimi's architecture.
 
 The code also names the secret that this reconstruction does **not** possess.
 On the toy problem, raw context gives away the environment. At frontier scale,
@@ -485,20 +559,22 @@ SSI would need a stable way to discover or generate environments that are:
 4. routable without hidden group labels;
 5. increasingly useful, rather than increasingly redundant, as compute grows.
 
-That could look like adversarially generated worlds, self-play populations,
-learned curricula, latent routers, cross-play teachers, or a mechanism we have
-not named. The roster supports structured adaptive optimization; it does not
-uniquely identify an ensemble architecture.
+That could look like adversarially generated worlds, self-play, learned
+curricula, latent routers, cross-play teachers, or a mechanism we have not
+named. The roster supports structured adaptive optimization; it does not
+identify a particular MoE implementation.
 
-My best answer is therefore: **Ilya likely saw a scaling curve for structured
-population diversity—more compute buys new coherent learning environments,
-not merely a larger ERM model.** The result worth $5 billion would be the rule
-that discovers and anchors those environments. The optimizer, sampler, and
-precision system are what let NVIDIA scale it.
+My best answer is therefore: **Ilya likely saw a scaling curve in automatically
+discovered or generated environments coupled to conditional computation—more
+compute buys new coherent expert competence, not merely more steps on the same
+ERM objective.** The result worth $5 billion would be the rule that discovers,
+tests, and anchors those environments. The MoE is the readymade vessel; the
+environment rule is the secret. The optimizer, sampler, precision system, and
+NVIDIA infrastructure are what let it scale.
 
 Most likely place this is wrong: the raw-environment assumption did all the
 work here, while SSI's actual result is a numerics or optimizer-stability
 breakthrough. The discriminating public artifact would be a scaling result in
-environment count, cross-student transfer, routing, or continual acquisition.
+environment count, expert specialization, routing, or continual acquisition.
 A pure low-precision stability paper would instead favor the competing
 precision-first story.
