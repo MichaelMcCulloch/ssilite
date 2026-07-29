@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -54,40 +56,66 @@ def capped_entropic_weights(
     alpha: float,
     temperature: float,
     *,
+    base_weights: Tensor | None = None,
     bisection_steps: int = 80,
 ) -> Tensor:
     """Return a smooth, capped exponential tilt of empirical scores.
 
     This solves the entropy-regularized CVaR inner problem.  Its solution has
-    ``q_i = min(cap, c * exp(score_i / temperature))``; the scalar ``c`` is
-    found by bisection.  The computation is performed in float64 for stability
-    and the detached result is cast back to the input dtype.
+    ``q_i = min(base_i / alpha, c * base_i * exp(score_i / temperature))``;
+    the scalar ``c`` is found by bisection.  When ``base_weights`` is omitted,
+    the empirical uniform base is used.  The computation is performed in
+    float64 for stability and the detached result is cast back to the input
+    dtype.
     """
 
     _validate_scores(scores, alpha)
-    if temperature <= 0:
+    if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("temperature must be positive")
     if bisection_steps < 1:
         raise ValueError("bisection_steps must be positive")
 
     working = scores.to(dtype=torch.float64)
-    logits = (working - working.max()) / temperature
-    cap = _weight_cap(scores.numel(), alpha)
-    log_cap = working.new_tensor(cap).log()
+    if base_weights is None:
+        base = torch.full_like(working, 1 / working.numel())
+    else:
+        if base_weights.shape != scores.shape:
+            raise ValueError("base_weights must match scores")
+        if not base_weights.is_floating_point():
+            raise TypeError("base_weights must use a floating-point dtype")
+        if base_weights.device != scores.device:
+            raise ValueError("base_weights must be on the same device as scores")
+        if not torch.all(torch.isfinite(base_weights)) or torch.any(base_weights < 0):
+            raise ValueError("base_weights must be finite and non-negative")
+        base = base_weights.detach().to(dtype=torch.float64)
+        total = base.sum()
+        if not torch.isclose(total, total.new_tensor(1.0), atol=1e-8):
+            raise ValueError("base_weights must sum to one")
+        base = base / total
 
-    lower = -torch.logsumexp(logits, dim=0) - 2
-    upper = log_cap - logits.min() + 2
+    support = base > 0
+    logits = (working - working[support].max()) / temperature
+    supported_logits = logits[support]
+    supported_base = base[support]
+    log_ratio_cap = working.new_tensor(-math.log(alpha))
+    log_partition = torch.logsumexp(
+        supported_base.log() + supported_logits,
+        dim=0,
+    )
+
+    lower = -log_partition - 2
+    upper = log_ratio_cap - supported_logits.min() + 2
     for _ in range(bisection_steps):
         midpoint = (lower + upper) / 2
-        log_weights = torch.minimum(log_cap, midpoint + logits)
-        total = log_weights.exp().sum()
-        if total < 1:
-            lower = midpoint
-        else:
-            upper = midpoint
+        log_ratios = torch.minimum(log_ratio_cap, midpoint + supported_logits)
+        total = torch.dot(supported_base, log_ratios.exp())
+        move_lower = total < 1
+        lower = torch.where(move_lower, midpoint, lower)
+        upper = torch.where(move_lower, upper, midpoint)
 
-    log_weights = torch.minimum(log_cap, upper + logits)
-    weights = log_weights.exp()
+    log_ratios = torch.minimum(log_ratio_cap, upper + supported_logits)
+    weights = torch.zeros_like(working)
+    weights[support] = supported_base * log_ratios.exp()
     return weights.to(dtype=scores.dtype).detach()
 
 

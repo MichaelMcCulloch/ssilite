@@ -25,12 +25,32 @@ class DatasetSplit:
             flipped=self.flipped[indices],
         )
 
+    def to(self, device: torch.device | str) -> DatasetSplit:
+        """Move all learner tensors and diagnostic metadata together."""
+
+        return DatasetSplit(
+            features=self.features.to(device),
+            labels=self.labels.to(device),
+            clean_labels=self.clean_labels.to(device),
+            minority=self.minority.to(device),
+            flipped=self.flipped.to(device),
+        )
+
 
 @dataclass(frozen=True)
 class SupportProblem:
     train: DatasetSplit
     reservoir: DatasetSplit
     test: DatasetSplit
+
+    def to(self, device: torch.device | str) -> SupportProblem:
+        """Move every split to one execution device."""
+
+        return SupportProblem(
+            train=self.train.to(device),
+            reservoir=self.reservoir.to(device),
+            test=self.test.to(device),
+        )
 
 
 def _orthogonal_mechanisms(
@@ -85,6 +105,7 @@ def make_support_problem(
     test_size: int = 4096,
     core_dimensions: int = 18,
     minority_fraction: float = 0.05,
+    test_minority_fraction: float | None = None,
     label_noise: float = 0.04,
     context_separation: float = 3.0,
     seed: int = 0,
@@ -95,6 +116,12 @@ def make_support_problem(
         raise ValueError("all sizes and core_dimensions must be positive")
     if not 0 < minority_fraction < 1:
         raise ValueError("minority_fraction must lie strictly between zero and one")
+    if test_minority_fraction is None:
+        test_minority_fraction = minority_fraction
+    if not 0 < test_minority_fraction < 1:
+        raise ValueError(
+            "test_minority_fraction must lie strictly between zero and one"
+        )
     if not 0 <= label_noise < 0.5:
         raise ValueError("label_noise must lie in [0, 0.5)")
 
@@ -122,7 +149,7 @@ def make_support_problem(
         test_size,
         first,
         second,
-        minority_fraction=minority_fraction,
+        minority_fraction=test_minority_fraction,
         label_noise=0.0,
         context_separation=context_separation,
         generator=generator,

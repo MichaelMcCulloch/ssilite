@@ -17,9 +17,9 @@ from .quantization import stochastic_quantize, stochastic_quantize_rows
 class GradientEstimate:
     """Diagnostics from a quantized per-example gradient estimate."""
 
-    mean_grad_norm: float
-    quantization_mse: float
-    max_importance_weight: float
+    mean_grad_norm: float | Tensor
+    quantization_mse: float | Tensor
+    max_importance_weight: float | Tensor
 
 
 def apply_importance_weighted_gradients(
@@ -110,8 +110,15 @@ def apply_batched_binary_gradients(
     precision_bits: Tensor,
     *,
     generator: torch.Generator | None = None,
+    synchronize_diagnostics: bool = True,
 ) -> GradientEstimate:
-    """Vectorized binary-classification version of the reference estimator."""
+    """Vectorized binary-classification version of the reference estimator.
+
+    Setting ``synchronize_diagnostics=False`` leaves the three scalar
+    diagnostics as device tensors.  Long CUDA runs can then aggregate them
+    before a single host synchronization instead of synchronizing after every
+    optimizer step.
+    """
 
     if features.ndim < 2 or features.shape[0] == 0:
         raise ValueError("features must be a non-empty batch")
@@ -166,8 +173,17 @@ def apply_batched_binary_gradients(
         exact_sq_norm += gradient_rows.detach().square().sum()
         error_sq += (quantized_rows.detach() - gradient_rows.detach()).square().sum()
 
+    mean_grad_norm = (exact_sq_norm / batch_size).sqrt()
+    quantization_mse = error_sq / batch_size
+    max_importance_weight = importance_weights.max()
+    if synchronize_diagnostics:
+        return GradientEstimate(
+            mean_grad_norm=float(mean_grad_norm.item()),
+            quantization_mse=float(quantization_mse.item()),
+            max_importance_weight=float(max_importance_weight.item()),
+        )
     return GradientEstimate(
-        mean_grad_norm=float((exact_sq_norm / batch_size).sqrt().item()),
-        quantization_mse=float((error_sq / batch_size).item()),
-        max_importance_weight=float(importance_weights.max().item()),
+        mean_grad_norm=mean_grad_norm,
+        quantization_mse=quantization_mse,
+        max_importance_weight=max_importance_weight,
     )
