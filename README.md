@@ -26,8 +26,8 @@ Within a fixed support, reducible scores are tilted with a capped,
 entropy-regularized CVaR adversary:
 
 $$
-q_i=\min\left\{\frac{1}{\alpha n},
-c\exp\left(\frac{\ell_i-\ell_i^{\rm ref}}{\tau}\right)\right\}.
+q_i=\min\{\frac{1}{\alpha n},
+c\exp(\frac{\ell_i-\ell_i^{\rm ref}}{\tau})\}.
 $$
 
 The variance-aware proposal is
