@@ -22,6 +22,8 @@ ARM_NAMES = (
     "expected_only",
     "unvalidated",
     "joint",
+    "plain_single",
+    "prototype_joint",
     "environment_oracle",
 )
 
@@ -73,6 +75,7 @@ class UncertaintyBenchmarkConfig:
     common_target: float = 0.85
     rare_target: float = 0.75
     oracle_training_steps: int = 60
+    prototype_challenger_steps: int = 40
     device: str = "auto"
 
 
@@ -146,6 +149,7 @@ def _validate_config(config: UncertaintyBenchmarkConfig) -> None:
             config.core_dimensions,
             config.context_repetitions,
             config.oracle_training_steps,
+            config.prototype_challenger_steps,
         )
         < 1
     ):
@@ -193,10 +197,13 @@ def _make_split(
     context_separation: float,
     context_noise: float,
     context_repetitions: int,
-    generator: torch.Generator,
+    core_generator: torch.Generator,
+    stratum_generator: torch.Generator,
+    label_generator: torch.Generator,
+    context_generator: torch.Generator,
 ) -> UncertaintySplit:
-    core = torch.randn(count, common_rule.numel(), generator=generator)
-    uniforms = torch.rand(count, generator=generator)
+    core = torch.randn(count, common_rule.numel(), generator=core_generator)
+    uniforms = torch.rand(count, generator=stratum_generator)
     stratum = torch.zeros(count, dtype=torch.long)
     stratum[uniforms < rare_fraction] = 1
     stratum[
@@ -204,7 +211,7 @@ def _make_split(
     ] = 2
     common_labels = (core @ common_rule >= 0).float()
     rare_labels = (core @ rare_rule >= 0).float()
-    random_labels = torch.randint(2, (count,), generator=generator).float()
+    random_labels = torch.randint(2, (count,), generator=label_generator).float()
     clean_labels = torch.where(
         stratum == 1,
         rare_labels,
@@ -224,7 +231,7 @@ def _make_split(
     context = centers[stratum] + context_noise * torch.randn(
         count,
         2 * context_repetitions,
-        generator=generator,
+        generator=context_generator,
     )
     return UncertaintySplit(
         features=torch.cat((core, context), dim=1),
@@ -259,8 +266,10 @@ def make_uncertainty_spawning_problem(
         context_noise=context_noise,
     )
     _validate_config(config)
-    generator = torch.Generator().manual_seed(seed)
-    common_rule, rare_rule = _orthogonal_rules(core_dimensions, generator)
+    common_rule, rare_rule = _orthogonal_rules(
+        core_dimensions,
+        torch.Generator().manual_seed(seed),
+    )
     train = _make_split(
         train_size,
         common_rule=common_rule,
@@ -270,7 +279,10 @@ def make_uncertainty_spawning_problem(
         context_separation=context_separation,
         context_noise=context_noise,
         context_repetitions=context_repetitions,
-        generator=generator,
+        core_generator=torch.Generator().manual_seed(seed + 1_000_003),
+        stratum_generator=torch.Generator().manual_seed(seed + 2_000_033),
+        label_generator=torch.Generator().manual_seed(seed + 3_000_017),
+        context_generator=torch.Generator().manual_seed(seed + 4_000_037),
     )
     test = _make_split(
         test_size,
@@ -281,7 +293,10 @@ def make_uncertainty_spawning_problem(
         context_separation=context_separation,
         context_noise=context_noise,
         context_repetitions=context_repetitions,
-        generator=generator,
+        core_generator=torch.Generator().manual_seed(seed + 5_000_059),
+        stratum_generator=torch.Generator().manual_seed(seed + 6_000_083),
+        label_generator=torch.Generator().manual_seed(seed + 7_000_103),
+        context_generator=torch.Generator().manual_seed(seed + 8_000_123),
     )
     return UncertaintySpawningProblem(train=train, test=test)
 
@@ -469,7 +484,7 @@ def run_uncertainty_spawning_benchmark(
     config: UncertaintyBenchmarkConfig | None = None,
     spawning_config: SpawningMoEConfig | None = None,
 ) -> UncertaintyBenchmarkResult:
-    """Run all six paired causal arms over deterministic nested supports."""
+    """Run paired latent and non-latent causal arms over nested supports."""
 
     config = config or UncertaintyBenchmarkConfig()
     _validate_config(config)
@@ -486,10 +501,10 @@ def run_uncertainty_spawning_benchmark(
         context_noise=config.context_noise,
         seed=seed,
     )
-    permutation = torch.randperm(
-        max_budget,
-        generator=torch.Generator().manual_seed(seed + 15_485_863),
-    )
+    # The generated training stream is already i.i.d. and seed-randomized.
+    # Keeping its natural order makes every support prefix invariant when a
+    # later run extends the budget grid.
+    support_order = torch.arange(max_budget)
     resolved_spawning_config = replace(
         spawning_config or SpawningMoEConfig(seed=40_000 + seed),
         device=str(execution_device),
@@ -504,7 +519,7 @@ def run_uncertainty_spawning_benchmark(
         "joint",
     )
     for budget in config.budgets:
-        support = problem.train.take(permutation[:budget]).to(execution_device)
+        support = problem.train.take(support_order[:budget]).to(execution_device)
         arms: dict[str, CausalArmMetrics] = {}
         for mode in spawning_modes:
             result = train_spawning_moe(
@@ -515,6 +530,30 @@ def run_uncertainty_spawning_benchmark(
                 config=resolved_spawning_config,
             )
             arms[mode] = _spawning_metrics(result, support, test)
+        plain_config = replace(
+            resolved_spawning_config,
+            expert_architecture="plain",
+            routing_strategy="prototype",
+        )
+        plain_single = train_spawning_moe(
+            support.features,
+            support.labels,
+            test.features,
+            mode="single",
+            config=plain_config,
+        )
+        arms["plain_single"] = _spawning_metrics(plain_single, support, test)
+        prototype_joint = train_spawning_moe(
+            support.features,
+            support.labels,
+            test.features,
+            mode="joint",
+            config=replace(
+                plain_config,
+                challenger_steps=config.prototype_challenger_steps,
+            ),
+        )
+        arms["prototype_joint"] = _spawning_metrics(prototype_joint, support, test)
         arms["environment_oracle"] = _oracle_metrics(
             support=support,
             test=test,
@@ -553,7 +592,7 @@ def run_uncertainty_spawning_benchmark(
         caveat=(
             "The three-stratum metadata is used only for post-training accuracy, "
             "birth attribution, and the explicit environment-oracle ceiling. "
-            "All five spawning arms receive identical observed features, labels, "
+            "All spawning arms receive identical observed features, labels, "
             "stream order, initialization seeds, and proposal seeds. Random-pocket "
             "accuracy is descriptive because its labels are irreducible."
         ),
@@ -572,6 +611,16 @@ def main(argv: list[str] | None = None) -> None:
         default=list(UncertaintyBenchmarkConfig().budgets),
     )
     parser.add_argument("--test-size", type=int, default=3000)
+    parser.add_argument(
+        "--prototype-challenger-steps",
+        type=int,
+        default=UncertaintyBenchmarkConfig().prototype_challenger_steps,
+    )
+    parser.add_argument(
+        "--latent-dimensions",
+        type=int,
+        default=SpawningMoEConfig().latent_dimensions,
+    )
     parser.add_argument("--proposal-min-support", type=int, default=32)
     parser.add_argument("--challenger-steps", type=int, default=80)
     parser.add_argument("--router-steps", type=int, default=60)
@@ -581,12 +630,14 @@ def main(argv: list[str] | None = None) -> None:
     config = UncertaintyBenchmarkConfig(
         budgets=tuple(arguments.budgets),
         test_size=arguments.test_size,
+        prototype_challenger_steps=arguments.prototype_challenger_steps,
         device=arguments.device,
     )
     results = []
     for seed in arguments.seeds:
         spawning_config = SpawningMoEConfig(
             max_experts=arguments.max_experts,
+            latent_dimensions=arguments.latent_dimensions,
             proposal_min_support=arguments.proposal_min_support,
             challenger_steps=arguments.challenger_steps,
             router_steps=arguments.router_steps,

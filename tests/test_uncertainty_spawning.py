@@ -53,6 +53,22 @@ def test_dormant_experts_are_zero_gradient_and_excluded_from_routes() -> None:
         assert torch.count_nonzero(parameter.grad[1:]).item() == 0
 
 
+def test_plain_experts_omit_shared_and_rms_paths() -> None:
+    model = SpawningMoE(
+        input_dimensions=3,
+        hidden_dimensions=8,
+        expert_architecture="plain",
+        max_experts=2,
+        feature_mean=torch.zeros(3),
+        feature_scale=torch.ones(3),
+    )
+    model.initialize(torch.Generator().manual_seed(7))
+
+    assert model.shared_output is None
+    assert model.routed_norm is None
+    assert model.latent_dimensions == model.hidden_dimensions
+
+
 def test_activation_is_contiguous_deterministic_and_capacity_bounded() -> None:
     first = _model(max_experts=2)
     second = _model(max_experts=2)
@@ -251,6 +267,15 @@ def test_random_label_pocket_fails_but_coherent_rule_passes_held_out_evidence() 
         mode="joint",
         config=config,
     )
+    prototype_decision = evaluate_birth_proposal(
+        model,
+        _proposal(random_labels=False, proposal_id=2),
+        coherent_replay,
+        coherent_replay_labels,
+        torch.zeros(coherent_replay.shape[0], dtype=torch.long),
+        mode="joint",
+        config=replace(config, routing_strategy="prototype"),
+    )
 
     assert not random_decision.accepted
     assert random_decision.evidence is not None
@@ -261,6 +286,9 @@ def test_random_label_pocket_fails_but_coherent_rule_passes_held_out_evidence() 
     assert coherent_decision.evidence.lower_confidence_bound > 0
     assert coherent_decision.evidence.unexpected_uncertainty > 0.9
     assert coherent_decision.evidence.context_switch_log_margin > 0
+    assert prototype_decision.accepted
+    assert prototype_decision.evidence is not None
+    assert prototype_decision.evidence.anchor_route_accuracy > 0.85
 
 
 def test_training_api_has_no_hidden_metadata_and_counts_exact_base_work() -> None:

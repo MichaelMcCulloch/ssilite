@@ -101,6 +101,10 @@ uv run ssilite-sample-efficiency \
   --seeds 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 \
   --budgets 0 32 64 128 256 \
   --device cuda
+uv run ssilite-uncertainty-spawning \
+  --seeds 0 1 2 3 4 5 6 7 \
+  --budgets 512 1024 1536 2048 2560 4096 \
+  --device cuda
 ```
 
 `ssilite` runs the original acquisition plus `q/p/b` prototype.
@@ -109,7 +113,9 @@ uv run ssilite-sample-efficiency \
 reconstruction and its identifiability controls. `ssilite-sample-efficiency`
 runs the final formal-MoE experiment: one tensorized expert bank, one learned
 top-1 router, and the lean nested-support curve without the out-of-fold trust
-filter.
+filter. `ssilite-uncertainty-spawning` starts with one active expert and makes
+later specialists earn activation through held-out expected/unexpected
+uncertainty evidence.
 
 The reported experiments below used:
 
@@ -132,7 +138,7 @@ uv run --with mypy mypy src/ssilite
 uv build
 ```
 
-Current local verification: 69 tests, Ruff lint and format, Mypy, and source
+Current local verification: 84 tests, Ruff lint and format, Mypy, and source
 plus wheel builds.
 
 ## Layout
@@ -153,8 +159,14 @@ plus wheel builds.
   teacher-forced specialist training, and genuine sparse top-1 dispatch.
 - `sample_efficiency.py`: nested-support, matched-compute formal-MoE benchmark
   with grid-censored target crossings and per-expert routing diagnostics.
+- `uncertainty_spawning.py`: expected-noise calibration, held-out
+  change evidence, latent expert activation, and sparse online routing.
+- `uncertainty_spawning_experiment.py`: three-regime causal benchmark,
+  environment-oracle ceiling, and strict JSON driver.
 - `scripts/plot_sample_efficiency.py`: paired uncertainty plots and compact
   CSV/JSON artifact generation for every formal-MoE control.
+- `scripts/plot_uncertainty_spawning.py`: all-arm birth, accuracy, and
+  compute artifacts for endogenous regime discovery.
 - `experiment.py`: original support-acquisition experiment.
 - `followup.py`: corrected Fable controls.
 - `reconstruction.py`: paired SSI-hypothesis experiment and counterexample.
@@ -437,6 +449,140 @@ uv run ssilite-sample-efficiency \
   --device cuda |
 uv run --with 'matplotlib>=3.10' python scripts/plot_sample_efficiency.py \
   --output-prefix artifacts/sample_efficiency_variants
+```
+
+## Endogenous regimes: expected and unexpected uncertainty
+
+The fixed-environment result proves the value of `(specialist, matching gate)`
+but supplies every environment before training. The spawning experiment removes
+that assumption. It starts with one active expert; dormant tensor slices are
+zero, unroutable, and gradient-free until a coherent failure regime earns a
+birth.
+
+The controller is a functional synthesis of three computational-neuroscience
+results:
+
+- [Yu and Dayan (2005)](https://doi.org/10.1016/j.neuron.2005.04.026):
+  acetylcholine reports expected uncertainty within the current context, while
+  norepinephrine reports unexpected uncertainty about the context itself.
+- [Dayan and Yu (2006)](https://doi.org/10.1080/09548980601004024): phasic
+  norepinephrine acts as an interrupt when observations undermine the current
+  top-down model.
+- [Nassar et al. (2012)](https://doi.org/10.1038/nn.3130): change-point
+  probability raises learning rate, while relative uncertainty controls
+  ordinary within-context adaptation.
+
+For expert-local binary error count `E` in `N` calibrated observations, the
+digital expected-uncertainty state is
+
+```math
+\eta_e=\frac{a+E}{a+b+N}.
+```
+
+A candidate regime receives a permanent fit/validation split. Its challenger
+may train on the fit partition, but structural evidence comes from untouched
+labels:
+
+```math
+\operatorname{logit}\Omega
+=
+\operatorname{logit}H
++
+\sum_{\mathrm{held\ out}}
+\log\frac{
+p(y\mid x,\mathrm{challenger})
+}{
+p(y\mid x,\mathrm{incumbent+expected\ noise})
+}.
+```
+
+Birth additionally requires the unexpected-change odds to beat the
+expected-noise odds after the Yu-Dayan context-persistence correction. Thus a
+large loss is only surprise; a specialist is born only when a routable
+alternative rule explains held-out outcomes.
+
+The expert vessel incorporates the useful part of Kimi K3's
+[Stable LatentMoE](https://arxiv.org/abs/2607.24653): contiguous latent routed
+capacity and RMS normalization before the expert-local readout. A linear
+full-width path carries common structure. Two Kimi mechanisms were deliberately
+not copied:
+
+- uniform load balancing conflicts with genuinely rare regimes;
+- a full nonlinear shared SiTU-GLU path solved the toy context switch inside
+  the single expert, erasing the treatment being measured.
+
+Across eight CUDA seeds, the corrected prefix-stable nested curve gives:
+
+| Observed labels | Single common | Single rare | Joint common | Joint rare | Joint rare births | Joint false births |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 0.928 | 0.571 | 0.928 | 0.733 | 0.50 | 0.00 |
+| 1,536 | 0.958 | 0.631 | 0.960 | 0.888 | 1.00 | 0.00 |
+| 2,048 | 0.962 | 0.687 | 0.972 | 0.869 | 1.00 | 0.00 |
+| 2,560 | 0.932 | 0.776 | 0.939 | 0.917 | 1.00 | 0.00 |
+| 4,096 | 0.960 | 0.854 | 0.957 | 0.943 | 1.00 | 0.00 |
+
+For the configured `0.75` rare and `0.85` common mean target, spawning crosses
+at 1,536 labels and the same-architecture single expert at 2,560: **1.67x label
+efficiency**, or 40% fewer labels. At a post-hoc `0.85` rare target, the grid
+crossings are 1,536 versus 4,096, or **2.67x**. The raw-loss spawner eventually
+births on the random pocket in six of eight seeds and the unvalidated spawner
+does so in every seed; the joint controller has zero such births across the
+grid.
+
+The Stable LatentMoE vessel is not the source of that gain. A paired ablation
+uses ordinary one-hidden-layer specialists and replaces every provisional
+learned router with an equal-prior diagonal-LDA context gate. For standardized
+features `z`, regime centroid `mu_e`, and pooled within-regime diagonal
+precision `Lambda`, its analytic route score is
+
+```math
+g_e(z)=2\mu_e^\mathsf{T}\Lambda z
+-\mu_e^\mathsf{T}\Lambda\mu_e.
+```
+
+The gate consumes no outcome labels and no backward passes. Expected
+uncertainty still calibrates ordinary within-context failures; unexpected
+uncertainty still decides whether held-out predictive evidence earns a new
+ordinary specialist.
+
+| Observed labels | Plain single common | Plain single rare | Prototype joint common | Prototype joint rare | Rare births | False births |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 0.907 | 0.581 | 0.919 | 0.650 | 0.25 | 0.00 |
+| 1,536 | 0.949 | 0.648 | 0.950 | 0.827 | 0.63 | 0.00 |
+| 2,048 | 0.941 | 0.740 | 0.944 | 0.808 | 0.63 | 0.00 |
+| 2,560 | 0.961 | 0.778 | 0.963 | 0.872 | 0.75 | 0.00 |
+| 4,096 | 0.958 | 0.876 | 0.964 | 0.928 | 0.75 | 0.00 |
+
+The non-latent pair recovers the same configured crossing: 1,536 labels versus
+2,560, again **1.67x label efficiency**. At those crossings it uses 8,831
+versus 2,560 backward example-passes (**3.45x**) and 15,621 versus 8,120
+forward example-passes (**1.92x**). Mean rare accuracy improves by 17.9 points
+at 1,536 labels, with six of eight paired seed differences positive and zero
+stochastic-pocket births. At the post-hoc `0.85` rare target it crosses at
+2,560 versus 4,096 labels (**1.6x**) while costing 2.99x backward and 1.93x
+forward work.
+
+The latent controller still spends 67,691 backward and 74,560 forward
+example-passes at its configured crossing, versus 2,560 and 8,120 for its
+single expert. Stable latent capacity is therefore an engineering option here,
+not the mechanism behind sample efficiency. The recoverable mechanism is the
+pair `(validated coherent regime, matching specialist)`.
+
+![Expected/unexpected uncertainty spawning controls](artifacts/uncertainty_spawning.png)
+
+[Vector figure](artifacts/uncertainty_spawning.svg),
+[long-form summary](artifacts/uncertainty_spawning.csv), and
+[seed-level results](artifacts/uncertainty_spawning.json) are included.
+Reproduce them with:
+
+```console
+uv run ssilite-uncertainty-spawning \
+  --seeds 0 1 2 3 4 5 6 7 \
+  --budgets 512 1024 1536 2048 2560 4096 \
+  --device cuda |
+uv run --with 'matplotlib>=3.10' python \
+  scripts/plot_uncertainty_spawning.py \
+  --output-prefix artifacts/uncertainty_spawning
 ```
 
 ## The identifiability wall

@@ -5,7 +5,7 @@ Example:
 
     uv run ssilite-uncertainty-spawning \
       --seeds 0 1 2 3 4 5 6 7 \
-      --budgets 512 1024 1536 --device cuda |
+      --budgets 512 1024 1536 2048 2560 4096 --device cuda |
     uv run --with 'matplotlib>=3.10' python \
       scripts/plot_uncertainty_spawning.py \
       --output-prefix artifacts/uncertainty_spawning
@@ -35,10 +35,12 @@ class ArmStyle:
 
 ARMS = (
     ArmStyle("single", "Single expert", "#202020", "-", "o"),
+    ArmStyle("plain_single", "Plain single expert", "#666666", "--", "o"),
     ArmStyle("raw_loss", "Raw-loss spawner", "#D55E00", "--", "v"),
     ArmStyle("expected_only", "Expected only", "#777777", ":", "o"),
     ArmStyle("unvalidated", "Unvalidated spawner", "#E69F00", "-.", "D"),
-    ArmStyle("joint", "Joint controller", "#009E73", "-", "s"),
+    ArmStyle("joint", "Latent joint controller", "#009E73", "-", "s"),
+    ArmStyle("prototype_joint", "Prototype-gated joint", "#CC79A7", "-", "P"),
     ArmStyle("environment_oracle", "Environment oracle", "#0072B2", "--", "^"),
 )
 
@@ -236,6 +238,7 @@ def _plot(
         handles,
         labels,
         loc="upper center",
+        bbox_to_anchor=(0.5, 0.955),
         ncol=3,
         frameon=False,
     )
@@ -243,9 +246,15 @@ def _plot(
         "Expected vs. unexpected uncertainty: held-out expert spawning",
         y=0.995,
     )
-    figure.tight_layout(rect=(0, 0, 1, 0.90))
+    figure.tight_layout(rect=(0, 0, 1, 0.86))
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_prefix.with_suffix(".svg"), bbox_inches="tight")
+    svg_path = output_prefix.with_suffix(".svg")
+    figure.savefig(svg_path, bbox_inches="tight")
+    svg_text = svg_path.read_text(encoding="utf-8")
+    svg_path.write_text(
+        "\n".join(line.rstrip() for line in svg_text.splitlines()) + "\n",
+        encoding="utf-8",
+    )
     figure.savefig(
         output_prefix.with_suffix(".png"),
         dpi=220,

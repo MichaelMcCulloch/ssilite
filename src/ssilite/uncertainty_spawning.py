@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .environment_ensemble import discover_feature_environments
-from .environment_moe import TensorizedExpertBank
 
 type SpawnerMode = Literal[
     "single",
@@ -32,6 +31,9 @@ type SpawnerMode = Literal[
     "unvalidated",
     "joint",
 ]
+type ExpertArchitecture = Literal["stable_latent", "plain"]
+type RoutingStrategy = Literal["learned", "prototype"]
+type ExpertParameters = tuple[Tensor, Tensor, Tensor, Tensor]
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,9 @@ class SpawningMoEConfig:
 
     max_experts: int = 3
     hidden_dimensions: int = 16
+    latent_dimensions: int = 16
+    expert_architecture: ExpertArchitecture = "stable_latent"
+    routing_strategy: RoutingStrategy = "learned"
     batch_size: int = 32
     learning_rate: float = 0.02
     weight_decay: float = 1e-4
@@ -67,6 +72,7 @@ class SpawningMoEConfig:
     router_learning_rate: float = 0.05
     router_min_proposal_accuracy: float = 0.70
     router_min_anchor_accuracy: float = 0.85
+    prototype_variance_floor: float = 0.05
     collateral_tolerance: float = 0.05
     collateral_min_support: int = 8
     collateral_practical_margin: float = 0.00
@@ -172,7 +178,7 @@ class ChallengerDecision:
     accepted: bool
     reason: str
     evidence: BirthEvidence | None
-    expert_parameters: tuple[Tensor, Tensor, Tensor, Tensor] | None
+    expert_parameters: ExpertParameters | None
     router_weight: Tensor | None
     router_bias: Tensor | None
 
@@ -224,8 +230,71 @@ class _WorkCounter:
         return SpawningCompute(**asdict(self))
 
 
+class TensorizedLatentExpertBank(nn.Module):
+    """Contiguous routed transforms operating in a compact latent space."""
+
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        input_dimensions: int,
+        latent_dimensions: int,
+    ) -> None:
+        super().__init__()
+        if min(num_experts, input_dimensions, latent_dimensions) < 1:
+            raise ValueError("expert count and dimensions must be positive")
+        self.num_experts = num_experts
+        self.input_dimensions = input_dimensions
+        self.latent_dimensions = latent_dimensions
+        shape = (num_experts, latent_dimensions, input_dimensions)
+        self.input_weight = nn.Parameter(torch.empty(shape))
+        self.input_bias = nn.Parameter(torch.empty(num_experts, latent_dimensions))
+        self.output_weight = nn.Parameter(torch.empty(num_experts, latent_dimensions))
+        self.output_bias = nn.Parameter(torch.empty(num_experts))
+        self.reset_parameters()
+
+    def reset_parameters(self, generator: torch.Generator | None = None) -> None:
+        input_bound = 1 / math.sqrt(self.input_dimensions)
+        output_bound = 1 / math.sqrt(self.latent_dimensions)
+        with torch.no_grad():
+            for parameter in (self.input_weight, self.input_bias):
+                parameter.uniform_(-input_bound, input_bound, generator=generator)
+            self.output_weight.uniform_(
+                -output_bound,
+                output_bound,
+                generator=generator,
+            )
+            self.output_bias.uniform_(
+                -output_bound,
+                output_bound,
+                generator=generator,
+            )
+
+    def active_latents(
+        self,
+        features: Tensor,
+        *,
+        active_count: int,
+    ) -> Tensor:
+        return torch.tanh(
+            torch.einsum("nd,ehd->enh", features, self.input_weight[:active_count])
+            + self.input_bias[:active_count, None, :]
+        )
+
+    def selected_latents(
+        self,
+        features: Tensor,
+        expert_ids: Tensor,
+    ) -> Tensor:
+        selected_input = self.input_weight[expert_ids]
+        return torch.tanh(
+            torch.bmm(selected_input, features.unsqueeze(-1)).squeeze(-1)
+            + self.input_bias[expert_ids]
+        )
+
+
 class SpawningMoE(nn.Module):
-    """A preallocated tensorized expert bank with contiguous active capacity."""
+    """Preallocated experts with an optional Stable-Latent-style vessel."""
 
     feature_mean: Tensor
     feature_scale: Tensor
@@ -236,12 +305,25 @@ class SpawningMoE(nn.Module):
         *,
         input_dimensions: int,
         hidden_dimensions: int,
+        latent_dimensions: int | None = None,
+        expert_architecture: ExpertArchitecture = "stable_latent",
         max_experts: int,
         feature_mean: Tensor,
         feature_scale: Tensor,
     ) -> None:
         super().__init__()
-        if min(input_dimensions, hidden_dimensions, max_experts) < 1:
+        if expert_architecture not in {"stable_latent", "plain"}:
+            raise ValueError(f"unknown expert architecture: {expert_architecture!r}")
+        resolved_latent = (
+            hidden_dimensions
+            if expert_architecture == "plain"
+            else (
+                min(input_dimensions, hidden_dimensions)
+                if latent_dimensions is None
+                else latent_dimensions
+            )
+        )
+        if min(input_dimensions, hidden_dimensions, resolved_latent, max_experts) < 1:
             raise ValueError("dimensions and maximum capacity must be positive")
         if feature_mean.shape != (input_dimensions,):
             raise ValueError("feature_mean must match input_dimensions")
@@ -254,11 +336,27 @@ class SpawningMoE(nn.Module):
         ):
             raise ValueError("feature_scale must be finite and positive")
         self.input_dimensions = input_dimensions
+        self.hidden_dimensions = hidden_dimensions
+        self.latent_dimensions = resolved_latent
+        self.expert_architecture = expert_architecture
         self.max_experts = max_experts
-        self.experts = TensorizedExpertBank(
+        # Keep the always-on path deliberately linear. A full SiTU shared MLP
+        # can itself learn the context-conditioned rule and erase the causal
+        # distinction between scale-and-pray and earned specialist capacity.
+        self.shared_output = (
+            nn.Linear(input_dimensions, 1)
+            if expert_architecture == "stable_latent"
+            else None
+        )
+        self.experts = TensorizedLatentExpertBank(
             num_experts=max_experts,
             input_dimensions=input_dimensions,
-            hidden_dimensions=hidden_dimensions,
+            latent_dimensions=resolved_latent,
+        )
+        self.routed_norm = (
+            nn.RMSNorm(resolved_latent)
+            if expert_architecture == "stable_latent"
+            else None
         )
         self.router = nn.Linear(input_dimensions, max_experts)
         self.register_buffer("feature_mean", feature_mean.detach().clone())
@@ -275,10 +373,17 @@ class SpawningMoE(nn.Module):
         """Initialize expert zero and leave every dormant slice exactly zero."""
 
         self.experts.reset_parameters(generator)
-        bound = 1 / math.sqrt(self.input_dimensions)
         with torch.no_grad():
-            self.router.weight.uniform_(-bound, bound, generator=generator)
-            self.router.bias.uniform_(-bound, bound, generator=generator)
+            layers = [self.router]
+            if self.shared_output is not None:
+                layers.append(self.shared_output)
+            for layer in layers:
+                bound = 1 / math.sqrt(layer.in_features)
+                layer.weight.uniform_(-bound, bound, generator=generator)
+                if layer.bias is not None:
+                    layer.bias.uniform_(-bound, bound, generator=generator)
+            if self.routed_norm is not None:
+                self.routed_norm.weight.fill_(1)
             if self.max_experts > 1:
                 self.experts.input_weight[1:].zero_()
                 self.experts.input_bias[1:].zero_()
@@ -296,14 +401,30 @@ class SpawningMoE(nn.Module):
 
         self._validate_features(features)
         active = self.active_expert_count
-        input_weight = self.experts.input_weight[:active]
-        input_bias = self.experts.input_bias[:active]
-        output_weight = self.experts.output_weight[:active]
-        output_bias = self.experts.output_bias[:active]
-        hidden = torch.tanh(
-            torch.einsum("nd,ehd->enh", features, input_weight) + input_bias[:, None, :]
+        routed = self.experts.active_latents(
+            features,
+            active_count=active,
         )
-        return torch.einsum("enh,eh->en", hidden, output_weight) + output_bias[:, None]
+        if self.expert_architecture == "plain":
+            return (routed * self.experts.output_weight[:active, None, :]).sum(
+                dim=-1
+            ) + self.experts.output_bias[:active, None]
+        if self.routed_norm is None:
+            raise RuntimeError("stable-latent experts require RMS normalization")
+        routed_logits = (
+            self.routed_norm(routed) * self.experts.output_weight[:active, None, :]
+        ).sum(dim=-1) + self.experts.output_bias[:active, None]
+        return routed_logits + self.shared_logits(features).unsqueeze(0)
+
+    def shared_logits(self, features: Tensor) -> Tensor:
+        self._validate_features(features)
+        if self.shared_output is None:
+            return torch.zeros(
+                features.shape[0],
+                device=features.device,
+                dtype=features.dtype,
+            )
+        return self.shared_output(features).squeeze(-1)
 
     def active_router_logits(self, features: Tensor) -> Tensor:
         """Compute router outputs only for active parameter rows."""
@@ -328,11 +449,26 @@ class SpawningMoE(nn.Module):
         return logits, probabilities, active_ids[logits.argmax(dim=-1)]
 
     def selected_expert_logits(self, features: Tensor, expert_ids: Tensor) -> Tensor:
+        self._validate_features(features)
         if expert_ids.shape != (features.shape[0],):
             raise ValueError("expert_ids must contain one ID per example")
         if torch.any((expert_ids < 0) | (expert_ids >= self.active_expert_count)):
             raise ValueError("expert_ids must select active experts")
-        return self.experts.selected_logits(features, expert_ids)
+        resolved_ids = expert_ids.to(device=features.device, dtype=torch.long)
+        routed = self.experts.selected_latents(
+            features,
+            resolved_ids,
+        )
+        if self.expert_architecture == "plain":
+            return (routed * self.experts.output_weight[resolved_ids]).sum(
+                dim=-1
+            ) + self.experts.output_bias[resolved_ids]
+        if self.routed_norm is None:
+            raise RuntimeError("stable-latent experts require RMS normalization")
+        routed_logits = (
+            self.routed_norm(routed) * self.experts.output_weight[resolved_ids]
+        ).sum(dim=-1) + self.experts.output_bias[resolved_ids]
+        return self.shared_logits(features) + routed_logits
 
     def forward(self, features: Tensor) -> tuple[Tensor, Tensor]:
         _, _, expert_ids = self.route(features)
@@ -341,7 +477,7 @@ class SpawningMoE(nn.Module):
     def parent_parameters(
         self,
         expert_id: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> ExpertParameters:
         if not 0 <= expert_id < self.active_expert_count:
             raise ValueError("parent expert must be active")
         return (
@@ -354,7 +490,7 @@ class SpawningMoE(nn.Module):
     def activate(
         self,
         *,
-        expert_parameters: tuple[Tensor, Tensor, Tensor, Tensor],
+        expert_parameters: ExpertParameters,
         router_weight: Tensor,
         router_bias: Tensor,
     ) -> int:
@@ -682,26 +818,67 @@ class UnexpectedUncertaintyController:
 
 
 class _ProvisionalExpert(nn.Module):
+    shared_output_weight: Tensor
+    shared_output_bias: Tensor
+    routed_norm_weight: Tensor
+
     def __init__(
         self,
-        parameters: tuple[Tensor, Tensor, Tensor, Tensor],
+        model: SpawningMoE,
+        parameters: ExpertParameters,
     ) -> None:
         super().__init__()
-        input_weight, input_bias, output_weight, output_bias = parameters
+        (
+            input_weight,
+            input_bias,
+            output_weight,
+            output_bias,
+        ) = parameters
         self.input_weight = nn.Parameter(input_weight)
         self.input_bias = nn.Parameter(input_bias)
         self.output_weight = nn.Parameter(output_weight)
         self.output_bias = nn.Parameter(output_bias)
+        self.expert_architecture = model.expert_architecture
+        if model.expert_architecture == "plain":
+            return
+        if model.routed_norm is None or model.shared_output is None:
+            raise RuntimeError("stable-latent experts require shared and RMS modules")
+        self.rms_epsilon = model.routed_norm.eps
+        for name, tensor in (
+            ("shared_output_weight", model.shared_output.weight),
+            ("shared_output_bias", model.shared_output.bias),
+            ("routed_norm_weight", model.routed_norm.weight),
+        ):
+            if tensor is None:
+                raise RuntimeError(f"{name} unexpectedly has no tensor")
+            self.register_buffer(name, tensor.detach().clone())
 
     def forward(self, features: Tensor) -> Tensor:
-        hidden = torch.tanh(F.linear(features, self.input_weight, self.input_bias))
-        return F.linear(
-            hidden,
+        routed = torch.tanh(F.linear(features, self.input_weight, self.input_bias))
+        if self.expert_architecture == "plain":
+            return F.linear(
+                routed,
+                self.output_weight.unsqueeze(0),
+                self.output_bias.unsqueeze(0),
+            ).squeeze(-1)
+        shared_logits = F.linear(
+            features,
+            self.shared_output_weight,
+            self.shared_output_bias,
+        ).squeeze(-1)
+        normalized = F.rms_norm(
+            routed,
+            (routed.shape[-1],),
+            self.routed_norm_weight,
+            self.rms_epsilon,
+        )
+        return shared_logits + F.linear(
+            normalized,
             self.output_weight.unsqueeze(0),
             self.output_bias.unsqueeze(0),
         ).squeeze(-1)
 
-    def detached_parameters(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def detached_parameters(self) -> ExpertParameters:
         return (
             self.input_weight.detach().clone(),
             self.input_bias.detach().clone(),
@@ -817,6 +994,81 @@ def _train_router(
     work.router_training_forward_examples += config.router_steps * examples_per_step
     work.router_training_backward_examples += config.router_steps * examples_per_step
     return router
+
+
+def _prototype_router(
+    *,
+    model: SpawningMoE,
+    proposal_features: Tensor,
+    anchor_features: Tensor,
+    anchor_routes: Tensor,
+    variance_floor: float,
+) -> nn.Linear:
+    """Build an equal-prior diagonal-LDA gate with no learned parameters."""
+
+    active_count = model.active_expert_count
+    standardized_proposal = (
+        proposal_features - model.feature_mean
+    ) / model.feature_scale
+    standardized_anchors = (anchor_features - model.feature_mean) / model.feature_scale
+    groups: list[Tensor] = []
+    centroids: list[Tensor] = []
+    for expert_id in range(active_count):
+        members = standardized_anchors[anchor_routes == expert_id]
+        if members.shape[0]:
+            groups.append(members)
+            centroids.append(members.mean(dim=0))
+        else:
+            # A 512-point replay normally represents every active regime.
+            # Zero is the conservative fallback when an expert is absent:
+            # router weights do not retain enough information to reconstruct
+            # its centroid after the previous precision scaling.
+            centroids.append(torch.zeros_like(standardized_proposal[0]))
+            groups.append(centroids[-1].unsqueeze(0))
+    groups.append(standardized_proposal)
+    centroids.append(standardized_proposal.mean(dim=0))
+    stacked = torch.stack(centroids)
+    residual_sum = torch.zeros_like(stacked[0])
+    for group, centroid in zip(groups, centroids, strict=True):
+        residual_sum += (group - centroid.unsqueeze(0)).square().sum(dim=0)
+    residual_degrees = max(1, sum(max(0, group.shape[0] - 1) for group in groups))
+    precision = (residual_sum / residual_degrees).clamp_min(variance_floor).reciprocal()
+    router = nn.Linear(model.input_dimensions, active_count + 1).to(
+        proposal_features.device
+    )
+    with torch.no_grad():
+        router.weight.copy_(2 * stacked * precision)
+        router.bias.copy_(-(stacked.square() * precision).sum(dim=-1))
+    return router
+
+
+def _provisional_router(
+    *,
+    model: SpawningMoE,
+    proposal_features: Tensor,
+    anchor_features: Tensor,
+    anchor_routes: Tensor,
+    config: SpawningMoEConfig,
+    seed: int,
+    work: _WorkCounter,
+) -> nn.Linear:
+    if config.routing_strategy == "prototype":
+        return _prototype_router(
+            model=model,
+            proposal_features=proposal_features,
+            anchor_features=anchor_features,
+            anchor_routes=anchor_routes,
+            variance_floor=config.prototype_variance_floor,
+        )
+    return _train_router(
+        model=model,
+        proposal_features=proposal_features,
+        anchor_features=anchor_features,
+        anchor_routes=anchor_routes,
+        config=config,
+        seed=seed,
+        work=work,
+    )
 
 
 def _generator(device: torch.device, seed: int) -> torch.Generator:
@@ -946,7 +1198,7 @@ def evaluate_birth_proposal(
         fit_features.shape[0] + validation_features.shape[0]
     )
 
-    provisional_router = _train_router(
+    provisional_router = _provisional_router(
         model=model,
         proposal_features=fit_features,
         anchor_features=fit_anchors,
@@ -974,7 +1226,10 @@ def evaluate_birth_proposal(
     candidate_anchor_labels = fit_anchor_labels[candidate_anchor_mask]
     candidate_anchor_routes = fit_anchor_routes[candidate_anchor_mask]
 
-    challenger = _ProvisionalExpert(model.parent_parameters(parent_expert)).to(device)
+    challenger = _ProvisionalExpert(
+        model,
+        model.parent_parameters(parent_expert),
+    ).to(device)
     optimizer = torch.optim.AdamW(
         challenger.parameters(),
         lr=config.challenger_learning_rate,
@@ -1052,8 +1307,24 @@ def evaluate_birth_proposal(
                 validation_anchors - model.feature_mean
             ) / model.feature_scale
             routed_anchors = provisional_router(standardized_anchors).argmax(dim=-1)
-            anchor_route_accuracy = float(
-                (routed_anchors == validation_anchor_routes).float().mean().item()
+            preserved_anchors = routed_anchors != new_expert
+            accuracy_mask = (
+                preserved_anchors
+                if config.routing_strategy == "prototype"
+                else torch.ones_like(preserved_anchors)
+            )
+            anchor_route_accuracy = (
+                float(
+                    (
+                        routed_anchors[accuracy_mask]
+                        == validation_anchor_routes[accuracy_mask]
+                    )
+                    .float()
+                    .mean()
+                    .item()
+                )
+                if torch.any(accuracy_mask)
+                else 1.0
             )
             baseline_logits = model.selected_expert_logits(
                 validation_anchors,
@@ -1133,7 +1404,11 @@ def evaluate_birth_proposal(
         -config.context_hazard
     )
     posterior_log_odds = prior_log_odds + rule_log_bayes_factor
-    unexpected_uncertainty = 1 / (1 + math.exp(-posterior_log_odds))
+    if posterior_log_odds >= 0:
+        unexpected_uncertainty = 1 / (1 + math.exp(-posterior_log_odds))
+    else:
+        posterior_odds = math.exp(posterior_log_odds)
+        unexpected_uncertainty = posterior_odds / (1 + posterior_odds)
     expected_odds = estimated_noise_rate / (1 - estimated_noise_rate)
     switch_factor = model.active_expert_count / (
         config.context_persistence * (1 - config.context_persistence)
@@ -1204,7 +1479,7 @@ def evaluate_birth_proposal(
         # Once the decision is fixed, all accepted pseudo-labels may supervise
         # the final copied router. Outcome labels in the validation partition
         # still never entered challenger optimization.
-        provisional_router = _train_router(
+        provisional_router = _provisional_router(
             model=model,
             proposal_features=features,
             anchor_features=fit_anchors,
@@ -1270,9 +1545,14 @@ class _ReplayReservoir:
 
 
 def _validate_config(config: SpawningMoEConfig) -> None:
+    if config.expert_architecture not in {"stable_latent", "plain"}:
+        raise ValueError(f"unknown expert architecture: {config.expert_architecture!r}")
+    if config.routing_strategy not in {"learned", "prototype"}:
+        raise ValueError(f"unknown routing strategy: {config.routing_strategy!r}")
     positive_integers = (
         config.max_experts,
         config.hidden_dimensions,
+        config.latent_dimensions,
         config.batch_size,
         config.warmup_count,
         config.calibration_capacity,
@@ -1312,6 +1592,7 @@ def _validate_config(config: SpawningMoEConfig) -> None:
             config.learning_rate,
             config.challenger_learning_rate,
             config.router_learning_rate,
+            config.prototype_variance_floor,
         )
         <= 0
     ):
@@ -1404,6 +1685,8 @@ def train_spawning_moe(
     model = SpawningMoE(
         input_dimensions=training.shape[1],
         hidden_dimensions=config.hidden_dimensions,
+        latent_dimensions=config.latent_dimensions,
+        expert_architecture=config.expert_architecture,
         max_experts=config.max_experts,
         feature_mean=feature_mean,
         feature_scale=feature_scale,

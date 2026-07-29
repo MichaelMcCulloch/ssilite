@@ -76,6 +76,33 @@ def test_problem_contains_distinct_evaluation_only_strata() -> None:
     assert torch.equal(problem.train.labels, problem.train.clean_labels)
 
 
+def test_problem_support_is_prefix_stable_when_budget_grid_extends() -> None:
+    small = make_uncertainty_spawning_problem(
+        train_size=96,
+        test_size=120,
+        seed=17,
+    )
+    extended = make_uncertainty_spawning_problem(
+        train_size=192,
+        test_size=120,
+        seed=17,
+    )
+
+    for field in ("features", "labels", "clean_labels", "stratum"):
+        torch.testing.assert_close(
+            getattr(small.train, field),
+            getattr(extended.train, field)[:96],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            getattr(small.test, field),
+            getattr(extended.test, field),
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_small_benchmark_runs_every_causal_arm_with_strict_json() -> None:
     result = run_uncertainty_spawning_benchmark(
         seed=3,
@@ -94,6 +121,12 @@ def test_small_benchmark_runs_every_causal_arm_with_strict_json() -> None:
     for arm in point.arms.values():
         assert sum(arm.route_counts) == _tiny_benchmark_config().test_size
         assert arm.compute
+    assert (
+        point.arms["prototype_joint"].compute["router_training_backward_examples"] == 0
+    )
+    assert (
+        point.arms["prototype_joint"].compute["router_training_forward_examples"] == 0
+    )
     encoded = json.dumps(asdict(result), allow_nan=False, sort_keys=True)
     assert json.loads(encoded)["seed"] == 3
 
@@ -107,6 +140,27 @@ def test_small_benchmark_is_deterministic() -> None:
     first = run_uncertainty_spawning_benchmark(**arguments)
     second = run_uncertainty_spawning_benchmark(**arguments)
     assert asdict(first) == asdict(second)
+
+
+def test_benchmark_prefix_is_stable_when_budget_grid_extends() -> None:
+    spawning_config = _tiny_spawning_config()
+    short = run_uncertainty_spawning_benchmark(
+        seed=11,
+        config=_tiny_benchmark_config(),
+        spawning_config=spawning_config,
+    )
+    extended = run_uncertainty_spawning_benchmark(
+        seed=11,
+        config=UncertaintyBenchmarkConfig(
+            **{
+                **asdict(_tiny_benchmark_config()),
+                "budgets": (192, 256),
+            }
+        ),
+        spawning_config=spawning_config,
+    )
+
+    assert asdict(short.points[0]) == asdict(extended.points[0])
 
 
 def test_driver_cli_prints_strict_json(monkeypatch, capsys) -> None:
