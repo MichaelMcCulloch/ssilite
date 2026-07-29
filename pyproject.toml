@@ -1,0 +1,36 @@
+[project]
+name = "ssilite"
+version = "0.1.0"
+description = "Prototype for support acquisition and compute-aware robust learning"
+readme = "README.md"
+authors = [
+    { name = "Michael McCulloch", email = "michael.james.mcculloch@fastmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3",
+    "torch>=2.7",
+]
+
+[project.scripts]
+ssilite = "ssilite:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "ruff>=0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
