@@ -12,46 +12,46 @@ separate operation.
 
 ## The four variables
 
-For losses \(\ell_i(\theta)\), the prototype keeps four decisions visibly
+For losses $\ell_i(\theta)$, the prototype keeps four decisions visibly
 separate:
 
-\[
+$$
 a:\text{ acquire new support},\qquad
 q:\text{ robust objective},\qquad
 p:\text{ gradient proposal},\qquad
 b:\text{ precision}.
-\]
+$$
 
 Within a fixed support, reducible scores are tilted with a capped,
 entropy-regularized CVaR adversary:
 
-\[
+$$
 q_i=\min\left\{\frac{1}{\alpha n},
 c\exp\left(\frac{\ell_i-\ell_i^{\rm ref}}{\tau}\right)\right\}.
-\]
+$$
 
 The variance-aware proposal is
 
-\[
+$$
 p_i^{\rm raw}\propto
 q_i\sqrt{\lVert g_i\rVert^2+\sigma_i^2(b_i)},
-\]
+$$
 
-followed by defensive mixtures with \(q\) and the uniform distribution. Given
+followed by defensive mixtures with $q$ and the uniform distribution. Given
 IID sampling with replacement, the estimator is
 
-\[
+$$
 \widehat G=
 \frac1B\sum_{j=1}^B
 \frac{q_{I_j}}{p_{I_j}}Q_{b_{I_j}}(g_{I_j}).
-\]
+$$
 
 `Q` uses stochastic rounding, so the estimator remains conditionally unbiased.
 The discrete precision allocator greedily buys the largest reduction in
 
-\[
+$$
 \sum_i \frac{q_i^2}{p_i}\sigma_i^2(b_i)
-\]
+$$
 
 per unit of expected precision cost.
 
@@ -75,7 +75,7 @@ The default experiment creates:
 - an unlabeled reservoir;
 - a clean test distribution.
 
-It compares ERM and joint \(q/p/b\) control on both the original and expanded
+It compares ERM and joint $q/p/b$ control on both the original and expanded
 support. Output is JSON with overall, majority, and minority accuracy plus
 robust mass and precision diagnostics.
 
@@ -117,7 +117,7 @@ statistically because ordinary PyTorch kernels do not execute different
 examples in one batch at different formats.
 
 The synthetic experiment uses clean generator labels to construct
-\(\ell^{\rm ref}\). That is an oracle control used to isolate the coverage
+$\ell^{\rm ref}$. That is an oracle control used to isolate the coverage
 question. It does not solve the demonstrated problem of learning an
 irreducibility estimator from the same biased distribution.
 
@@ -130,18 +130,18 @@ the mechanism observable; it is not a scaling result.
 
 - `acquisition.py`: label-free support expansion.
 - `risk.py`: hard CVaR and smooth capped robust weights.
-- `allocation.py`: variance-aware \(p\) and budgeted \(b\).
+- `allocation.py`: variance-aware $p$ and budgeted $b$.
 - `quantization.py`: deterministic score and unbiased gradient quantization.
 - `estimator.py`: reference and vectorized per-example gradient estimators.
-- `controller.py`: damped joint \(q/p/b\) state.
+- `controller.py`: damped joint $q/p/b$ state.
 - `experiment.py`: reproducible comparison on the support-limited problem.
 
 ## Answer to the experiment
 
 **Qualified yes at the mechanism level; not yet at the causal-efficiency
-level.** One learner can maintain a robust objective \(q\), sample from a
-different variance-aware proposal \(p\), correct the resulting importance
-weights, and allocate a precision \(b\) under a fixed expected-cost budget
+level.** One learner can maintain a robust objective $q$, sample from a
+different variance-aware proposal $p$, correct the resulting importance
+weights, and allocate a precision $b$ under a fixed expected-cost budget
 without destabilizing training.
 
 A fresh seed-0 run of the checked-in defaults produced:
@@ -150,8 +150,8 @@ A fresh seed-0 run of the checked-in defaults produced:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | ERM, fixed support | 0.921 | 0.941 | 0.508 | — | — | — | — |
 | ERM, acquired support | 0.927 | 0.944 | 0.581 | — | — | — | — |
-| Joint \(q/p/b\), fixed support | 0.946 | 0.963 | 0.607 | 0.028 | 0.176 | 2.000 | 0.0061 |
-| Joint \(q/p/b\), acquired support | 0.953 | 0.957 | 0.864 | 0.021 | 0.375 | 2.000 | 0.0032 |
+| Joint $q/p/b$, fixed support | 0.946 | 0.963 | 0.607 | 0.028 | 0.176 | 2.000 | 0.0061 |
+| Joint $q/p/b$, acquired support | 0.953 | 0.957 | 0.864 | 0.021 | 0.375 | 2.000 | 0.0032 |
 
 On the original support, joint control improved overall accuracy by 2.5 points
 and minority accuracy by 9.9 points over ERM. It assigned 17.6% of objective
@@ -166,20 +166,20 @@ reached `0.864`.
 
 The four decisions did not contribute equally to what was demonstrated:
 
-- **Objective \(q\):** the run shows useful capped robust reweighting when
+- **Objective $q$:** the run shows useful capped robust reweighting when
   supplied with reducible-loss scores. The oracle clean-label reference used
   to construct those scores means the experiment does not show that the
   learner can discover the right objective from the biased distribution
   alone.
-- **Sampling \(p\):** the estimator remains unbiased after sampling away from
-  \(q\), and the proposal minimizes the modeled second moment before defensive
-  mixing. The end-to-end run has no uniform-\(p\) ablation, so it does not yet
+- **Sampling $p$:** the estimator remains unbiased after sampling away from
+  $q$, and the proposal minimizes the modeled second moment before defensive
+  mixing. The end-to-end run has no uniform-$p$ ablation, so it does not yet
   measure the sampling-efficiency gain.
-- **Precision \(b\):** the allocator respected a mean cost budget of `2.0`
+- **Precision $b$:** the allocator respected a mean cost budget of `2.0`
   across 4-, 8-, and 16-bit choices while stochastic rounding preserved
   unbiasedness. There is no fixed-precision control or custom kernel, so this
   is not evidence of a numerical or wall-clock speedup.
-- **Acquisition \(a\):** fixed-support control could only move minority
+- **Acquisition $a$:** fixed-support control could only move minority
   accuracy to `0.607`. Selecting 256 examples from a 4,096-example unlabeled
   reservoir found 160 minority examples and moved it to `0.864`. A weighting
   policy cannot replace missing support.
@@ -207,6 +207,6 @@ full RL.
 The experiment therefore answers the opening question narrowly: the three
 within-support controls can coexist coherently and the resulting learner
 performs well, but the present comparison does not isolate whether adaptive
-\(p\) or \(b\) outperforms simpler alternatives. The strongest observed result
+$p$ or $b$ outperforms simpler alternatives. The strongest observed result
 is that joint within-support control helps, but support acquisition is
 necessary when coverage is the binding constraint.
